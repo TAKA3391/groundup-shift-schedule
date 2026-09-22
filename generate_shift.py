@@ -344,17 +344,23 @@ def write_pattern(ws, row, pattern):
         ws[f'{col}{row}'] = code
 
 
-def highlight_understaffed(ws, daily_counts, biz_days):
-    """Total（row84）が4人未満の営業日を赤く強調表示する。戻り値: 該当日のlist"""
-    flagged = []
+def highlight_out_of_range(ws, daily_counts, biz_days):
+    """Total（row84）が4〜6人の範囲外（4人未満 または 7人以上）の営業日を
+    赤く強調表示する。戻り値: (understaffed_days, overstaffed_days)"""
+    understaffed = []
+    overstaffed = []
     for day in biz_days:
-        if daily_counts.get(day, 0) < MIN_DAILY_TOTAL:
+        count = daily_counts.get(day, 0)
+        if count < MIN_DAILY_TOTAL or count > MAX_DAILY_TOTAL:
             col = get_column_letter(FIRST_DAY_COL + day - 1)
             cell = ws[f'{col}{TOTAL_ROW}']
             cell.fill = RED_FILL
             cell.font = RED_FONT
-            flagged.append(day)
-    return flagged
+            if count < MIN_DAILY_TOTAL:
+                understaffed.append(day)
+            else:
+                overstaffed.append(day)
+    return understaffed, overstaffed
 
 
 # ---------------------------------------------------------------------------
@@ -539,10 +545,10 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
             info['pattern'] = {day: code for day in sorted(g['days'])}
             info['blocked'] = g['blocked']
 
-    # --- Total（配置人数）が4人未満の営業日を赤強調 ---
+    # --- Total（配置人数）が4〜6人の範囲外（4人未満・7人以上）の営業日を赤強調 ---
     for info in rows_info:
         write_pattern(ws, info['row'], info['pattern'])
-    understaffed_days = highlight_understaffed(ws, daily_counts, biz_days)
+    understaffed_days, overstaffed_days = highlight_out_of_range(ws, daily_counts, biz_days)
 
     all_patterns = {}
     code_by_key = {}
@@ -581,6 +587,7 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         'unmatched': unmatched,
         'daily_counts': daily_counts,
         'understaffed_days': understaffed_days,
+        'overstaffed_days': overstaffed_days,
         'biz_days': biz_days,
         'groups': groups,
         'svc_table': svc_table,
@@ -627,9 +634,9 @@ def review_unit(result, staff_master, year, month, requests, unit_label):
                       '（勤務可能希望があれば埋まります。なければ人員確保の相談が必要）')
     else:
         lines.append('  ✓ Total人数: 営業日はすべて4人以上')
-    over = [d for d in result['biz_days'] if result['daily_counts'].get(d, 0) > MAX_DAILY_TOTAL]
-    if over:
-        lines.append(f'  ・参考: Total人数が6人を超える営業日: {"、".join(f"{d}日" for d in over)}'
+    if result['overstaffed_days']:
+        days_str = '、'.join(f'{d}日' for d in result['overstaffed_days'])
+        lines.append(f'  ・参考: Total人数が6人を超える営業日（出力Excel上は赤字表示）: {days_str}'
                       '（自動では減らしていません。必要なら手動調整してください）')
 
     # (3) 連続勤務6日以上
@@ -727,7 +734,12 @@ def build_report(result, staff_master, year, month, requests):
                 counts[role] = counts.get(role, 0) + 1
         summary = ', '.join(f'{k}:{v}' for k, v in counts.items())
         total = result['daily_counts'].get(day, 0)
-        flag = '  ⚠4人未満' if day in result['understaffed_days'] else ''
+        if day in result['understaffed_days']:
+            flag = '  ⚠4人未満'
+        elif day in result['overstaffed_days']:
+            flag = '  ⚠6人超'
+        else:
+            flag = ''
         biz = '' if day in result['biz_days'] else '（休業日）'
         lines.append(f'  {day:2d}日{biz}: Total={total} [{summary}]{flag}')
     return '\n'.join(lines)
@@ -764,6 +776,20 @@ def main():
                               svc_table)
     result_pm = process_unit(wb, args.source_pm, new_pm, 'PM', staff_master, requests, args.year, args.month,
                               svc_table)
+
+    # 出力ファイルには、その月のシフト案（午前・午後の2タブ）だけを残す。
+    # ベースファイル（シフト2026.xlsx）に含まれる記入方法・記載例・過去月の
+    # シートなどは複製元として読み込んだだけなので、出力からは削除する
+    # （ユーザー確定ルール、2026-10）。
+    # ただし「シフト記号表（勤務時間帯）」と「プルダウン・リスト」は削除しない：
+    # 午前・午後シート内の勤務時間数・サービス提供時間内の勤務時間数のVLOOKUP式や、
+    # 職種・資格のプルダウン（データの入力規則）がこの2シートを参照しているため、
+    # 消すとTotalなどの自動計算が0になったり、開いたときに警告が出たりする。
+    KEEP_ALWAYS = {'シフト記号表（勤務時間帯）', 'プルダウン・リスト'}
+    for sheet_name in list(wb.sheetnames):
+        if sheet_name in (new_am, new_pm) or sheet_name in KEEP_ALWAYS:
+            continue
+        del wb[sheet_name]
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
