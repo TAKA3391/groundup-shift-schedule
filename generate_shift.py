@@ -477,6 +477,24 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         else:
             r += 1
 
+    # --- 退職者など、staff_master.csvに存在しない氏名の行を出力シートから消す ---
+    # 「他の行で正しくマッチしている（＝現職スタッフの未使用重複スロット）」場合は
+    # 触らない。それ以外（＝どの行にも一致しない、本当に退職者などの可能性が高い行）
+    # だけ、氏名・職種・勤務形態記号・資格の欄を空にする。複製元（実績データが
+    # 入ったベースファイル）は一切変更しない（ws は複製先の新シートのみ）。
+    # ユーザー確定ルール（2026-10）：退職者の氏名が新しい月に毎回コピーされ続ける
+    # 問題を、複製元の実績データを消さずに解消するための措置。
+    matched_names = {info['name'] for info in rows_info}
+    cleared_rows = []
+    for r, name, role in unmatched:
+        if name not in matched_names:
+            for col in ('C', 'G', 'H', 'L'):
+                ws[f'{col}{r}'] = None
+            cleared_rows.append((r, name, role))
+    # 自動で消した行は、以降のレビュー・レポートでは「未対応の欠落」として
+    # 二重に警告しない（すでに解消済みのため）。
+    unmatched = [u for u in unmatched if u not in cleared_rows]
+
     code_col = 'default_code_am' if unit == 'AM' else 'default_code_pm'
 
     # --- パートスタッフ: 固定曜日 + 勤務可能希望 − 休み希望 ---
@@ -585,6 +603,7 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         'shortages': shortages,
         'run_violations': run_violations,
         'unmatched': unmatched,
+        'cleared_rows': cleared_rows,
         'daily_counts': daily_counts,
         'understaffed_days': understaffed_days,
         'overstaffed_days': overstaffed_days,
@@ -660,7 +679,14 @@ def review_unit(result, staff_master, year, month, requests, unit_label):
     if not mismatch and any(len(g['infos']) >= 2 for g in result['groups']):
         lines.append('  ✓ 兼務者の勤務日: 一致しています')
 
-    # (5) staff_master に一致しない行
+    # (5) staff_master.csvに存在しない退職者などの行を自動で氏名欄クリア
+    if result.get('cleared_rows'):
+        for r, name, role in result['cleared_rows']:
+            lines.append(f'  ・自動処理: シート{r}行目（{name}／{role}）はstaff_master.csvに'
+                         '見つからなかったため、氏名・職種・資格欄を自動で空にしました'
+                         '（複製元の実績データは変更していません）')
+
+    # (6) staff_master に一致しない行
     matched_names = {key.split('（')[0] for key in result['all_patterns']}
     real_gaps = []
     known_dupes = []
