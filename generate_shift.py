@@ -77,11 +77,15 @@ def clear_and_write_headers(ws, year, month):
 
 
 def clear_staff_shift_rows(ws, max_row=83):
-    """各スタッフのシフト記号行（3行1組の1行目）のS〜AW列を空にする"""
+    """各スタッフのシフト記号行（3行1組の1行目）のS〜AW列を空にする
+
+    注意: B列（No）は1行目だけ固定値で、2行目以降は "=B25+1" のような数式が
+    入っているため、B列がintかどうかでは判定できない。氏名（L列）の有無で判定する。
+    """
     r = 25
     while r < max_row:
-        no = ws[f'B{r}'].value
-        if isinstance(no, (int, float)):
+        name = ws[f'L{r}'].value
+        if name:
             for col_idx in range(FIRST_DAY_COL, FIRST_DAY_COL + 31):
                 col = get_column_letter(col_idx)
                 ws[f'{col}{r}'] = None
@@ -145,17 +149,17 @@ def build_report(all_patterns, staff_master, days_in_month):
     """ステップ3・4のためのサマリー: スタッフ別稼働日数、日別・職種別人員数"""
     lines = []
     lines.append('=== スタッフ別 稼働日数（この案） ===')
-    for name, pattern in all_patterns.items():
-        lines.append(f'  {name}: {len(pattern)}日')
+    for key, pattern in all_patterns.items():
+        lines.append(f'  {key}: {len(pattern)}日')
 
     lines.append('')
     lines.append('=== 日別・職種別 配置人数（この案） ===')
-    role_by_name = {s['name']: s.get('role', '') for s in staff_master}
+    # key は "氏名（職種）" の形式なので、括弧の中身を職種として使う
     for day in range(1, days_in_month + 1):
         counts = {}
-        for name, pattern in all_patterns.items():
+        for key, pattern in all_patterns.items():
             if day in pattern:
-                role = role_by_name.get(name, '?')
+                role = key.split('（')[-1].rstrip('）') if '（' in key else '?'
                 counts[role] = counts.get(role, 0) + 1
         summary = ', '.join(f'{k}:{v}' for k, v in counts.items())
         lines.append(f'  {day:2d}日: {summary}')
@@ -175,15 +179,21 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
     all_patterns = {}
     r = 25
     while r < ws.max_row:
-        no = ws[f'B{r}'].value
-        if isinstance(no, (int, float)):
-            name = ws[f'L{r}'].value
-            staff_row = next((s for s in staff_master if s['name'] == name), None)
+        # B列（No）は2行目以降 "=B25+1" のような数式のため使えない。氏名（L列）で判定する。
+        name = ws[f'L{r}'].value
+        if name:
+            role = ws[f'C{r}'].value
+            # 同じ人が複数の職種を兼務している場合があるため、氏名だけでなく
+            # 職種（シートのC列）も一致するstaff_master行を優先的に探す
+            staff_row = next((s for s in staff_master if s['name'] == name and s.get('role') == role), None)
+            if staff_row is None:
+                staff_row = next((s for s in staff_master if s['name'] == name), None)
             if staff_row and name:
                 pattern = default_pattern_for(staff_row, unit, year, month)
                 pattern = apply_requests(pattern, name, requests, year, month, unit)
                 write_pattern(ws, r, pattern)
-                all_patterns[name] = pattern
+                key = f'{name}（{role}）' if role else name
+                all_patterns[key] = pattern
             r += 3
         else:
             r += 1
