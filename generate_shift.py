@@ -269,6 +269,13 @@ def clear_and_write_headers(ws, year, month):
     ws['AC2'] = year
     ws['AG2'] = month
 
+    # (3)事業所における常勤の従業者が勤務すべき時間数（BB6, 時間/月）は複製元シートの
+    # 値をそのまま引き継いでしまう静的な数値セルなので、対象月の所定勤務日数に
+    # 合わせて毎回上書きする（ユーザー確定ルール、2026-10: 所定勤務日数×8時間）。
+    # 例: 2026年10月は所定21日 → 21×8=168時間。
+    target_days, _ = full_time_target_days(year, month)
+    ws['BB6'] = target_days * 8
+
     days_in_month = calendar.monthrange(year, month)[1]
 
     for day in range(1, 32):
