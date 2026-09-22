@@ -424,6 +424,21 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
     ws = wb.copy_worksheet(src)
     ws.title = new_sheet_name
 
+    # --- コピー元シート名へのハードコードされたシート参照を自己参照に修正 ---
+    # ベース様式（シフト2026.xlsx）の「(12)週平均勤務時間数」欄（AZ列、暦月モード）
+    # など一部の数式は、本来AX列と同様に自シート内で完結すべきところ、
+    # テンプレート作成時の入力ミスと思われる形で複製元シート名（'9月1'!や'9月2'!）
+    # を直接埋め込んでしまっている。copy_worksheet()は数式を文字列としてそのまま
+    # コピーするため、毎月このシート名を書き換えないと、複製元シートが出力に
+    # 含まれなくなった時点で#NAME?エラーになる（2026-10、ユーザー報告で発覚）。
+    # ここでシート参照部分（'9月1'!など）を取り除き、自シート内の自己参照に直す。
+    old_sheet_ref = f"'{source_sheet_name}'!"
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if isinstance(v, str) and v.startswith('=') and old_sheet_ref in v:
+                cell.value = v.replace(old_sheet_ref, '')
+
     days_in_month = clear_and_write_headers(ws, year, month)
     clear_staff_shift_rows(ws)
 
