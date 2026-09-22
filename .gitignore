@@ -1,0 +1,3 @@
+output/*.xlsx
+output/*_report.txt
+!.gitkeep
