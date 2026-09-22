@@ -4,7 +4,7 @@
 parse_request_sheet.py
 
 スタッフが記入した「シフト希望入力シート」（generate_request_sheet.py で作った
-{year}年_シフト希望入力.xlsx に、各自が休み希望・出勤可能を書き込んだもの）を読み込み、
+{year}年_シフト希望入力.xlsx に、各自が休み希望・出勤可能・有給を書き込んだもの）を読み込み、
 generate_shift.py にそのまま渡せる requests_YYYYMM.csv を月ごとに自動生成する。
 
 手作業でのCSV転記をなくすことで、入力ミス・転記漏れを防ぐのが目的。
@@ -34,7 +34,8 @@ from openpyxl import load_workbook
 
 OFF_LABEL = "休み希望"
 AVAILABLE_LABEL = "出勤可能"
-LABEL_TO_STATUS = {OFF_LABEL: "off", AVAILABLE_LABEL: "available"}
+PAID_LEAVE_LABEL = "有給"
+LABEL_TO_STATUS = {OFF_LABEL: "off", AVAILABLE_LABEL: "available", PAID_LEAVE_LABEL: "paid_leave"}
 
 MONTH_SHEET_RE = re.compile(r"^(\d{1,2})月$")
 

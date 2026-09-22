@@ -74,6 +74,13 @@ MAX_CONSECUTIVE_WORK_DAYS = 5  # 「6日以上の連続勤務」を避けるた�
 MIN_DAILY_TOTAL = 4
 MAX_DAILY_TOTAL = 6
 
+# 有休（paid_leave）の日にシフト表へ書き込むシフト記号。shift_codes.csv側で
+# 4.0時間（AM/PM共通）として定義済み（ユーザー確定ルール、2026-10）。
+# これにより月合計・週平均勤務時間数（AX/AZ列）にも有休分の時間が反映され、
+# 常勤スタッフの月間時間数が有休の有無に関わらず所定どおり（例: 168h/月の人は
+# 週平均・月合計とも一律の値）になる。
+PAID_LEAVE_CODE = '有'
+
 # 事業所の固定休業日（年をまたいで毎年同じ月日）。ユーザー確定ルール（2026-09）。
 FIXED_CLOSURE_MD = {
     (5, 3), (5, 4), (5, 5),        # ゴールデンウィーク
@@ -529,12 +536,19 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
                 pattern.setdefault(day, code)
         for day in blocked:
             pattern.pop(day, None)
+        # 有休の日もシフト表に「有」と明記し、月合計・週平均勤務時間数（AX/AZ列）に
+        # 反映されるようにする（パートスタッフも常勤と同様の扱い、ユーザー確定ルール、2026-10）。
+        pl_days = paid_leave_days(info['name'], requests, year, month)
+        for day in pl_days:
+            if day in biz_days:
+                pattern[day] = PAID_LEAVE_CODE
         info['pattern'] = pattern
         info['blocked'] = blocked
         info['code'] = code
         row_weight = 1 if counts_toward_total(code, info['role'], svc_table, total_roles) else 0
-        for day in pattern:
-            daily_counts[day] += row_weight
+        pl_weight = 1 if counts_toward_total(PAID_LEAVE_CODE, info['role'], svc_table, total_roles) else 0
+        for day, day_code in pattern.items():
+            daily_counts[day] += pl_weight if day_code == PAID_LEAVE_CODE else row_weight
 
     # --- 常勤スタッフ: 氏名単位でグループ化（兼務者は勤務日を必ず揃える） ---
     ft_groups_by_name = {}
@@ -556,10 +570,16 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         # 掛かっている行の数（例: 上口さんは生活相談員行(c)のみカウントし、
         # 管理者行(b)はカウントしない → weight=1）
         weight = sum(1 for info in infos if counts_toward_total(info['code'], info['role'], svc_table, total_roles))
+        # 有休（PAID_LEAVE_CODE）を書き込む日のTotal寄与ウェイトも別途計算しておく
+        # （有休の記号はshift_codes.csv上サービス提供時間内の勤務時間数が0より
+        # 大きいため、Totalにカウントされる。ユーザー確定ルール、2026-10）。
+        pl_weight = sum(1 for info in infos
+                         if counts_toward_total(PAID_LEAVE_CODE, info['role'], svc_table, total_roles))
         group = {
             'name': name,
             'infos': infos,
             'weight': weight,
+            'pl_weight': pl_weight,
             'blocked': blocked,
             'target': target_effective,
             'pl_days': pl_days,
@@ -568,6 +588,9 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         groups.append(group)
         for day in avail:
             daily_counts[day] += group['weight']
+        for day in pl_days:
+            if day in biz_days:
+                daily_counts[day] += pl_weight
 
     groups.sort(key=lambda g: g['name'])
     allocate_full_time_groups(groups, biz_days, daily_counts)
@@ -576,6 +599,11 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         for info in g['infos']:
             code = info['staff_row'].get(code_col, '').strip()
             info['pattern'] = {day: code for day in sorted(g['days'])}
+            # 有休の日もシフト表に「有」と明記し、月合計・週平均勤務時間数（AX/AZ列）に
+            # 反映されるようにする（ユーザー確定ルール、2026-10）。
+            for day in sorted(g['pl_days']):
+                if day in biz_days:
+                    info['pattern'][day] = PAID_LEAVE_CODE
             info['blocked'] = g['blocked']
 
     # --- Total（配置人数）が4〜6人の範囲外（4人未満・7人以上）の営業日を赤強調 ---
@@ -649,7 +677,9 @@ def review_unit(result, staff_master, year, month, requests, unit_label):
         seen_names.add(name)
         pl = len(paid_leave_days(name, requests, year, month))
         eff = max(0, target_days - pl)
-        actual = len(pattern)
+        # pattern には有休の日（PAID_LEAVE_CODE）も含まれるようになったため、
+        # 「実質所定日数」との比較は実際に稼働した日数（有休を除く）で行う。
+        actual = sum(1 for code in pattern.values() if code != PAID_LEAVE_CODE)
         if actual != eff and key not in result['shortages']:
             ok = False
             lines.append(f'  ✗ {key}: 実質所定{eff}日に対し実績{actual}日（一致しません）')
@@ -744,10 +774,14 @@ def build_report(result, staff_master, year, month, requests):
         name = key.split('（')[0]
         is_ft = keitai_by_name.get(name, '') in ('A', 'B')
         note = ''
+        # pattern には有休の日（PAID_LEAVE_CODE）も含まれる。稼働日数としては
+        # 有休を除いた実際の勤務日数で数える（ユーザー確定ルール、2026-10：
+        # 有休は月合計時間数には含めるが、稼働日数としては別枠のまま）。
+        worked_days = sum(1 for code in pattern.values() if code != PAID_LEAVE_CODE)
         if is_ft:
             pl_count = len(paid_leave_days(name, requests, year, month))
             target_effective = max(0, target_days - pl_count)
-            diff = len(pattern) - target_effective
+            diff = worked_days - target_effective
             pl_note = f'（うち有休{pl_count}日を除く実質所定{target_effective}日）' if pl_count else ''
             if key in shortages:
                 note = (f'  ※実質所定{target_effective}日{pl_note}に対し{shortages[key]}日不足 '
@@ -756,20 +790,22 @@ def build_report(result, staff_master, year, month, requests):
                 note = f'  ※実質所定{target_effective}日{pl_note}との差: {diff:+d}日 ← 要確認'
             else:
                 note = f'  （実質所定{target_effective}日{pl_note}と一致・自動調整済み）'
-        lines.append(f'  {key}: {len(pattern)}日{note}')
+        lines.append(f'  {key}: {worked_days}日{note}')
 
     lines.append('')
     lines.append('=== 日別・職種別 配置人数（この案。Total＝様式のTotal行と同じ集計方法） ===')
     lines.append('※ 事務作業用など、サービス提供時間に掛かっていないシフト記号（例: 管理者のb）は'
                  'Totalにカウントされません（様式の数式と同じ扱い）。')
     svc_table = result.get('svc_table', {})
-    code_by_key = result.get('code_by_key', {})
     role_by_key = result.get('role_by_key', {})
     total_roles = result.get('total_roles', set())
     for day in range(1, result['days_in_month'] + 1):
         counts = {}
         for key, pattern in all_patterns.items():
-            if day in pattern and counts_toward_total(code_by_key.get(key), role_by_key.get(key),
+            # その日実際にシートへ書き込まれたシフト記号（有休の日は'有'）で判定する。
+            # 以前は氏名ごとの既定コード（code_by_key）を使っていたが、有休の日は
+            # 既定コードと異なる記号（有）になるため、必ずpattern[day]を使う。
+            if day in pattern and counts_toward_total(pattern[day], role_by_key.get(key),
                                                         svc_table, total_roles):
                 role = key.split('（')[-1].rstrip('）') if '（' in key else '?'
                 counts[role] = counts.get(role, 0) + 1

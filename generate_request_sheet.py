@@ -43,6 +43,7 @@ WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 
 OFF_LABEL = "休み希望"
 AVAILABLE_LABEL = "出勤可能"
+PAID_LEAVE_LABEL = "有給"
 
 HEADER_FILL = PatternFill("solid", fgColor="2F5496")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
@@ -50,6 +51,7 @@ CLOSED_FILL = PatternFill("solid", fgColor="D9D9D9")
 SUNDAY_FILL = PatternFill("solid", fgColor="FCE4E4")
 OFF_FILL = PatternFill("solid", fgColor="F8CBAD")
 AVAILABLE_FILL = PatternFill("solid", fgColor="C6E0B4")
+PAID_LEAVE_FILL = PatternFill("solid", fgColor="FFE699")
 THIN = Side(style="thin", color="BFBFBF")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -87,6 +89,7 @@ def build_instructions_sheet(wb: Workbook):
         ("② セルの右側に出る▼（プルダウン）から選ぶ", False, 12),
         ("　・休み希望 → その日は休みたい場合", False, 12),
         ("　・出勤可能 → 普段の勤務日以外にも追加で出勤できる場合", False, 12),
+        ("　・有給 → その日に有給休暇を取得したい場合", False, 12),
         ("③ 希望がない日は空欄のままでOKです（何も入力しなくて大丈夫です）", False, 12),
         ("", False, 11),
         ("■ グレーのセルについて", True, 13),
@@ -94,7 +97,7 @@ def build_instructions_sheet(wb: Workbook):
         ("これらの日は入力不要です（入力しても反映されません）。", False, 12),
         ("", False, 11),
         ("■ 注意事項", True, 13),
-        ("・1つの日付につき、休み希望・出勤可能のどちらか一方だけを選んでください", False, 12),
+        ("・1つの日付につき、休み希望・出勤可能・有給のいずれか一方だけを選んでください", False, 12),
         ("・プルダウン以外の文字を直接入力すると、シフト作成に反映されない場合があります", False, 12),
         ("・入力が終わったら上書き保存してください（提出期限は管理者にご確認ください）", False, 12),
         ("", False, 11),
@@ -111,7 +114,8 @@ def build_instructions_sheet(wb: Workbook):
     legend_row = r + 1
     ws.cell(row=legend_row, column=1, value="色の見本").font = Font(bold=True, size=13)
     legend_row += 1
-    for label, fill in [(OFF_LABEL, OFF_FILL), (AVAILABLE_LABEL, AVAILABLE_FILL), ("施設休業日（入力不要）", CLOSED_FILL)]:
+    for label, fill in [(OFF_LABEL, OFF_FILL), (AVAILABLE_LABEL, AVAILABLE_FILL),
+                        (PAID_LEAVE_LABEL, PAID_LEAVE_FILL), ("施設休業日（入力不要）", CLOSED_FILL)]:
         c = ws.cell(row=legend_row, column=1, value=f"　{label}")
         c.fill = fill
         c.border = BORDER
@@ -154,12 +158,12 @@ def build_month_sheet(wb: Workbook, year: int, month: int, staff_names: list):
     # ドロップダウン（データの入力規則）
     dv = DataValidation(
         type="list",
-        formula1=f'"{OFF_LABEL},{AVAILABLE_LABEL}"',
+        formula1=f'"{OFF_LABEL},{AVAILABLE_LABEL},{PAID_LEAVE_LABEL}"',
         allow_blank=True,
         showDropDown=False,  # openpyxlの仕様上Falseで矢印が表示される
         showErrorMessage=True,
         errorTitle="入力エラー",
-        error="「休み希望」か「出勤可能」をプルダウンから選んでください。",
+        error="「休み希望」「出勤可能」「有給」のいずれかをプルダウンから選んでください。",
     )
     ws.add_data_validation(dv)
 
@@ -207,6 +211,10 @@ def build_month_sheet(wb: Workbook, year: int, month: int, staff_names: list):
     ws.conditional_formatting.add(
         staff_range,
         CellIsRule(operator="equal", formula=[f'"{AVAILABLE_LABEL}"'], fill=AVAILABLE_FILL),
+    )
+    ws.conditional_formatting.add(
+        staff_range,
+        CellIsRule(operator="equal", formula=[f'"{PAID_LEAVE_LABEL}"'], fill=PAID_LEAVE_FILL),
     )
 
     ws.freeze_panes = ws.cell(row=first_data_row, column=3)
