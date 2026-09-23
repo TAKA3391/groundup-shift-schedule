@@ -54,6 +54,7 @@ from pathlib import Path
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import PatternFill, Font
+from openpyxl.formatting.rule import CellIsRule
 
 try:
     import jpholiday
@@ -410,6 +411,34 @@ def highlight_out_of_range(ws, daily_counts, biz_days):
     return understaffed, overstaffed
 
 
+def add_total_conditional_formatting(ws, days_in_month):
+    """Total（row84）に、生成時点の状態に関わらず常に正しく判定されるよう、
+    Excelの条件付き書式（4人未満・7人以上を赤く強調）を追加する。
+
+    highlight_out_of_range() は生成した時点のdaily_countsに基づいて一度だけ
+    セルを赤く塗るだけなので、生成後にExcel上で手作業によりシフト記号を
+    書き換えた場合（有休の追加・変更を含む）は追従しない。Total自体は
+    様式のCOUNTIFS数式で常に再計算される（有休の記号「有」もサービス提供時間内の
+    勤務時間数が0より大きいためカウントされる）ため、条件付き書式を使えば
+    手作業での修正後もExcel上で自動的に赤字判定が更新される
+    （ユーザー確定ルール、2026-10：「有給を含んだ人数でTotalが4未満になる場合も
+    赤く表示する」を、生成時だけでなく常に成り立つようにするため）。
+    """
+    if days_in_month <= 0:
+        return
+    first_col = get_column_letter(FIRST_DAY_COL)
+    last_col = get_column_letter(FIRST_DAY_COL + days_in_month - 1)
+    cell_range = f'{first_col}{TOTAL_ROW}:{last_col}{TOTAL_ROW}'
+    ws.conditional_formatting.add(
+        cell_range,
+        CellIsRule(operator='lessThan', formula=[str(MIN_DAILY_TOTAL)], fill=RED_FILL, font=RED_FONT),
+    )
+    ws.conditional_formatting.add(
+        cell_range,
+        CellIsRule(operator='greaterThan', formula=[str(MAX_DAILY_TOTAL)], fill=RED_FILL, font=RED_FONT),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 常勤スタッフの自動配置（ステップ3）
 # ---------------------------------------------------------------------------
@@ -654,6 +683,8 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
     for info in rows_info:
         write_pattern(ws, info['row'], info['pattern'])
     understaffed_days, overstaffed_days = highlight_out_of_range(ws, daily_counts, biz_days)
+    # 生成後にExcel上で手作業修正しても赤字判定が追従するよう、条件付き書式も設定する
+    add_total_conditional_formatting(ws, days_in_month)
 
     all_patterns = {}
     code_by_key = {}
