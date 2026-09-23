@@ -70,6 +70,14 @@ STAFF_ROWS_END = 80  # この行(80)から「（参考）1日の職種別人員�
                       #   みなしてクリアすると、行80の数式を壊してTotalが過小集計になる
                       #   重大なバグがあったため、明示的な境界を設ける。）
 TOTAL_ROW = 84
+# (15)利用者数（予定作成時は定員数）、(16)サービス提供時間（平均提供時間）の行。
+# ベース様式では日付列ごとに固定値（例: 定員15人、平均提供時間3時間）が入っており、
+# 日曜（および固定休業日）の列だけ空欄になっている。copy_worksheet()はこの値を
+# そのままコピーするだけなので、複製元の月と対象月とで曜日がずれると、日曜以外の
+# 列が空欄のまま/日曜の列に値が残ったままになってしまう。ユーザー確定ルール
+# （2026-10）：対象月の日曜（営業日でない日）は0にする。
+CAPACITY_ROW = 77
+SERVICE_TIME_ROW = 78
 MAX_CONSECUTIVE_WORK_DAYS = 5  # 「6日以上の連続勤務」を避けるため、連続は5日まで
 MIN_DAILY_TOTAL = 4
 MAX_DAILY_TOTAL = 6
@@ -326,6 +334,38 @@ def clear_staff_shift_rows(ws, max_row=STAFF_ROWS_END):
         cell.font = Font()
 
 
+def rewrite_capacity_and_service_time(ws, days_in_month, biz_days):
+    """(15)利用者数・(16)サービス提供時間の行を対象月の曜日に合わせて書き直す。
+
+    複製元シート（例: 9月分）の値をそのままコピーすると、非営業日（日曜・固定休業日）
+    の列がコピー元の月の曜日ズレのまま残ってしまう（複製元で空欄だった列が対象月では
+    営業日だったり、その逆だったりする）。ここで複製元シートに実際に入っている
+    「営業日の値」（定員数・平均提供時間、通常は月をまたいで一定）を読み取り、
+    対象月の営業日はその値、非営業日（日曜・固定休業日）は0で書き直す
+    （ユーザー確定ルール、2026-10）。月の日数を超える列（29〜31日目）は空欄にする。
+    """
+    for row in (CAPACITY_ROW, SERVICE_TIME_ROW):
+        # 複製元シートに実際に入っている「営業日の値」を読み取る（通常は単一の定数）。
+        values = []
+        for col_idx in range(FIRST_DAY_COL, FIRST_DAY_COL + 31):
+            col = get_column_letter(col_idx)
+            v = ws[f'{col}{row}'].value
+            if v is not None:
+                values.append(v)
+        if not values:
+            continue
+        # 複製元シートで最も多く使われていた値を「営業日の値」として採用する
+        biz_value = max(set(values), key=values.count)
+        for day in range(1, 32):
+            col = get_column_letter(FIRST_DAY_COL + day - 1)
+            if day > days_in_month:
+                ws[f'{col}{row}'] = None
+            elif day in biz_days:
+                ws[f'{col}{row}'] = biz_value
+            else:
+                ws[f'{col}{row}'] = 0
+
+
 def default_pattern_for_part_time(staff_row, unit, year, month, biz_days):
     """パートスタッフの基本パターン（固定曜日）を営業日ベースで展開する"""
     code_col = 'default_code_am' if unit == 'AM' else 'default_code_pm'
@@ -451,6 +491,10 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
 
     biz_days = business_days_list(year, month)
     target_days, _ = full_time_target_days(year, month)
+
+    # (15)利用者数・(16)サービス提供時間を対象月の曜日に合わせて書き直す
+    # （日曜・固定休業日は0にする。ユーザー確定ルール、2026-10）。
+    rewrite_capacity_and_service_time(ws, days_in_month, biz_days)
 
     # 「Total」（(18) 1日の職種別人員内訳の合計、row84）は L80:L83 に列挙された
     # 職種（生活相談員・看護職員・介護職員・機能訓練指導員）のみを合計しており、
