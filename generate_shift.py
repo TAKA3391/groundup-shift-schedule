@@ -483,11 +483,17 @@ def allocate_full_time_groups(groups, biz_days, daily_counts):
     """常勤スタッフ（兼務者は氏名単位でグループ化済み）を、
     実質所定日数まで、その時点で最も手薄な営業日から順にラウンドロビンで埋める。
     6日以上連続勤務にならないよう候補日をガードする。
+
+    'forced'（1単位目で確定した出勤日をそのまま適用する2単位目のグループ）は
+    ここでは一切動かさない。target未達でも独自に埋め直さない（ユーザー確定ルール、
+    2026-11：「常勤スタッフの1単位目と2単位目の出勤日を合わせる」ため、2単位目側で
+    勝手に日を追加すると1単位目とずれてしまう）。
     """
     for g in groups:
         g.setdefault('run_violation', False)
+        g.setdefault('forced', False)
 
-    active = [g for g in groups if len(g['days']) < g['target']]
+    active = [g for g in groups if len(g['days']) < g['target'] and not g['forced']]
     while active:
         progressed = False
         for g in active:
@@ -516,7 +522,12 @@ def allocate_full_time_groups(groups, biz_days, daily_counts):
 # ---------------------------------------------------------------------------
 
 def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requests, year, month,
-                  svc_table):
+                  svc_table, forced_ft_days=None):
+    """forced_ft_days: {氏名: {'days': set(出勤日), 'run_violation': bool}}（省略可）。
+    指定された氏名の常勤スタッフは、ここで独自に出勤日を計算せず、この値をそのまま
+    使う。1単位目（AM）の結果を2単位目（PM）に渡すことで、常勤スタッフの1単位目・
+    2単位目の出勤日を完全に一致させるために使う（ユーザー確定ルール、2026-11）。
+    """
     src = wb[source_sheet_name]
     if new_sheet_name in wb.sheetnames:
         del wb[new_sheet_name]
@@ -671,6 +682,18 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         # 大きいため、Totalにカウントされる。ユーザー確定ルール、2026-10）。
         pl_weight = sum(1 for info in infos
                          if counts_toward_total(PAID_LEAVE_CODE, info['role'], svc_table, total_roles))
+
+        # forced_ft_days に氏名があれば、1単位目で確定した出勤日をそのまま使う
+        # （常勤スタッフの1単位目・2単位目の出勤日を一致させるため、ユーザー確定
+        # ルール、2026-11）。この場合はラウンドロビンで独自に日を追加しない。
+        forced_info = forced_ft_days.get(name) if forced_ft_days else None
+        if forced_info is not None:
+            group_days = set(forced_info.get('days', set())) & set(biz_days)
+            forced_run_violation = bool(forced_info.get('run_violation', False))
+        else:
+            group_days = set(avail)
+            forced_run_violation = False
+
         group = {
             'name': name,
             'infos': infos,
@@ -679,10 +702,12 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
             'blocked': blocked,
             'target': target_effective,
             'pl_days': pl_days,
-            'days': set(avail),
+            'days': group_days,
+            'forced': forced_info is not None,
+            'run_violation': forced_run_violation,
         }
         groups.append(group)
-        for day in avail:
+        for day in group_days:
             daily_counts[day] += group['weight']
         for day in pl_days:
             if day in biz_days:
@@ -857,6 +882,51 @@ def review_unit(result, staff_master, year, month, requests, unit_label):
     return '\n'.join(lines), ok
 
 
+def review_ft_unit_alignment(result_am, result_pm, staff_master):
+    """常勤スタッフの1単位目（AM）・2単位目（PM）の出勤日（有休の日を含む）が
+    完全に一致しているかを確認する（ユーザー確定ルール、2026-11：
+    「1と2は書類上別管理だが、勤務日は統一したい」）。
+
+    process_unit() 側でPM生成時にAMの出勤日をそのまま使う（forced_ft_days）
+    ようにしているため、通常は必ず一致するはずだが、AMとPMで対象の常勤スタッフ
+    構成が異なる（片方のシートにしか居ないなど）想定外のケースを検知するための
+    独立したチェック。
+    """
+    keitai_by_name = {s['name']: s.get('keitai', '') for s in staff_master}
+
+    def ft_days_by_name(result):
+        days_by_name = {}
+        for key, pattern in result['all_patterns'].items():
+            name = key.split('（')[0]
+            if keitai_by_name.get(name) not in ('A', 'B'):
+                continue
+            days_by_name.setdefault(name, set()).update(pattern.keys())
+        return days_by_name
+
+    days_am = ft_days_by_name(result_am)
+    days_pm = ft_days_by_name(result_pm)
+
+    lines = ['--- 常勤スタッフ 1単位目・2単位目の出勤日一致チェック ---']
+    ok = True
+    for name in sorted(set(days_am) | set(days_pm)):
+        d_am = days_am.get(name, set())
+        d_pm = days_pm.get(name, set())
+        if d_am != d_pm:
+            ok = False
+            detail = []
+            only_am = sorted(d_am - d_pm)
+            only_pm = sorted(d_pm - d_am)
+            if only_am:
+                detail.append('1単位目のみ出勤: ' + '、'.join(f'{d}日' for d in only_am))
+            if only_pm:
+                detail.append('2単位目のみ出勤: ' + '、'.join(f'{d}日' for d in only_pm))
+            lines.append(f'  ✗ {name}: ' + '／'.join(detail))
+    if ok:
+        lines.append('  ✓ 全常勤スタッフで1単位目・2単位目の出勤日が一致')
+    lines.append('  === 総合判定: ' + ('問題なし' if ok else '要確認あり（上記✗を参照）') + ' ===')
+    return '\n'.join(lines), ok
+
+
 # ---------------------------------------------------------------------------
 # サマリーレポート
 # ---------------------------------------------------------------------------
@@ -950,8 +1020,17 @@ def main():
 
     result_am = process_unit(wb, args.source_am, new_am, 'AM', staff_master, requests, args.year, args.month,
                               svc_table)
+
+    # 常勤スタッフは1単位目（AM）で確定した出勤日をそのまま2単位目（PM）にも
+    # 適用し、1単位目・2単位目の出勤日を完全に一致させる（ユーザー確定ルール、
+    # 2026-11：「1と2は書類上別管理だが、勤務日は統一したい」）。
+    forced_ft_days = {
+        g['name']: {'days': set(g['days']), 'run_violation': g.get('run_violation', False)}
+        for g in result_am['groups']
+    }
+
     result_pm = process_unit(wb, args.source_pm, new_pm, 'PM', staff_master, requests, args.year, args.month,
-                              svc_table)
+                              svc_table, forced_ft_days=forced_ft_days)
 
     # 出力ファイルには、その月のシフト案（午前・午後の2タブ）だけを残す。
     # ベースファイル（シフト2026.xlsx）に含まれる記入方法・記載例・過去月の
@@ -974,6 +1053,7 @@ def main():
     report_pm = build_report(result_pm, staff_master, args.year, args.month, requests)
     review_am, ok_am = review_unit(result_am, staff_master, args.year, args.month, requests, new_am + '（午前）')
     review_pm, ok_pm = review_unit(result_pm, staff_master, args.year, args.month, requests, new_pm + '（午後）')
+    review_align, ok_align = review_ft_unit_alignment(result_am, result_pm, staff_master)
 
     manual_staff = [
         s['name'] for s in staff_master
@@ -997,14 +1077,16 @@ def main():
         f.write(f'--- {new_pm}（午後） ---\n{report_pm}\n\n')
         f.write('\n=== レビュー（完成後の自動チェック） ===\n\n')
         f.write(review_am + '\n\n')
-        f.write(review_pm + '\n')
+        f.write(review_pm + '\n\n')
+        f.write(review_align + '\n')
 
     print(f'出力: {args.out}')
     print(f'レポート: {report_path}')
     print('')
     if manual_staff:
         print('不定期勤務のため未反映（手作業で入力）:', '、'.join(manual_staff))
-    print('レビュー結果:', '午前=' + ('OK' if ok_am else '要確認'), '/', '午後=' + ('OK' if ok_pm else '要確認'))
+    print('レビュー結果:', '午前=' + ('OK' if ok_am else '要確認'), '/', '午後=' + ('OK' if ok_pm else '要確認'),
+          '/', '出勤日一致=' + ('OK' if ok_align else '要確認'))
     print('詳細はレポートファイルのレビュー欄を確認してください。')
 
 
