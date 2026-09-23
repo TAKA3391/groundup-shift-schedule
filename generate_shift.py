@@ -411,7 +411,7 @@ def highlight_out_of_range(ws, daily_counts, biz_days):
     return understaffed, overstaffed
 
 
-def add_total_conditional_formatting(ws, days_in_month):
+def add_total_conditional_formatting(ws, biz_days):
     """Total（row84）に、生成時点の状態に関わらず常に正しく判定されるよう、
     Excelの条件付き書式（4人未満・7人以上を赤く強調）を追加する。
 
@@ -423,12 +423,35 @@ def add_total_conditional_formatting(ws, days_in_month):
     手作業での修正後もExcel上で自動的に赤字判定が更新される
     （ユーザー確定ルール、2026-10：「有給を含んだ人数でTotalが4未満になる場合も
     赤く表示する」を、生成時だけでなく常に成り立つようにするため）。
+
+    対象は営業日（biz_days）の列だけに限定する。日曜日や固定休業日・月末以降の
+    列はそもそもスタッフが配置されずTotalが0（または空）になるため、範囲に
+    含めてしまうと「営業日ではない日まで4人未満として赤字になる」誤表示になる
+    （ユーザー確認、2026-11：営業日以外は赤字対象外にする）。
     """
-    if days_in_month <= 0:
+    if not biz_days:
         return
-    first_col = get_column_letter(FIRST_DAY_COL)
-    last_col = get_column_letter(FIRST_DAY_COL + days_in_month - 1)
-    cell_range = f'{first_col}{TOTAL_ROW}:{last_col}{TOTAL_ROW}'
+    days_sorted = sorted(biz_days)
+    ranges = []
+    start = prev = days_sorted[0]
+    for d in days_sorted[1:]:
+        if d == prev + 1:
+            prev = d
+            continue
+        ranges.append((start, prev))
+        start = prev = d
+    ranges.append((start, prev))
+
+    range_strs = []
+    for s, e in ranges:
+        col_s = get_column_letter(FIRST_DAY_COL + s - 1)
+        if s == e:
+            range_strs.append(f'{col_s}{TOTAL_ROW}')
+        else:
+            col_e = get_column_letter(FIRST_DAY_COL + e - 1)
+            range_strs.append(f'{col_s}{TOTAL_ROW}:{col_e}{TOTAL_ROW}')
+    cell_range = ' '.join(range_strs)
+
     ws.conditional_formatting.add(
         cell_range,
         CellIsRule(operator='lessThan', formula=[str(MIN_DAILY_TOTAL)], fill=RED_FILL, font=RED_FONT),
@@ -684,7 +707,8 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         write_pattern(ws, info['row'], info['pattern'])
     understaffed_days, overstaffed_days = highlight_out_of_range(ws, daily_counts, biz_days)
     # 生成後にExcel上で手作業修正しても赤字判定が追従するよう、条件付き書式も設定する
-    add_total_conditional_formatting(ws, days_in_month)
+    # （日曜・固定休業日などの営業日以外は対象外にする）
+    add_total_conditional_formatting(ws, biz_days)
 
     all_patterns = {}
     code_by_key = {}
