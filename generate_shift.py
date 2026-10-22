@@ -10,9 +10,9 @@
   ステップ3: 常勤スタッフの所定勤務日数（有休を除く実質所定日数）に合わせて自動調整。
              候補日は「営業日」全体から、その時点で配置人数が最も少ない日を優先。
              6日以上の連続勤務にならないようガードする。
-  ステップ4: 1日あたりの配置人数（Total）が4〜6人になるよう、
+  ステップ4: 1日あたりの配置人数（Total）が5〜6人になるよう、
              スタッフが「勤務可能」欄に記載した日を優先的に組み込んで調整する
-             （記載がない場合は自動では人を追加しない。4人未満の営業日は
+             （記載がない場合は自動では人を追加しない。4人以下の営業日は
              出力Excel上で赤く強調表示し、レポートにも警告を出す）。
   完成後、独立したレビュー関数で「所定日数」「Total人数」「連続勤務」
   「兼務者の勤務日一致」などをもう一度チェックし、レポートに結果を出す。
@@ -80,7 +80,8 @@ TOTAL_ROW = 84
 CAPACITY_ROW = 77
 SERVICE_TIME_ROW = 78
 MAX_CONSECUTIVE_WORK_DAYS = 5  # 「6日以上の連続勤務」を避けるため、連続は5日まで
-MIN_DAILY_TOTAL = 4
+# 有給（シフト記号「有」）の人も含めたTotalが4人以下（＝5人未満）の営業日は赤字（ユーザー確定ルール、2026-10）
+MIN_DAILY_TOTAL = 5
 MAX_DAILY_TOTAL = 6
 
 # 有休（paid_leave）の日にシフト表へ書き込むシフト記号。shift_codes.csv側で
@@ -393,7 +394,7 @@ def write_pattern(ws, row, pattern):
 
 
 def highlight_out_of_range(ws, daily_counts, biz_days):
-    """Total（row84）が4〜6人の範囲外（4人未満 または 7人以上）の営業日を
+    """Total（row84）が5〜6人の範囲外（4人以下 または 7人以上）の営業日を
     赤く強調表示する。戻り値: (understaffed_days, overstaffed_days)"""
     understaffed = []
     overstaffed = []
@@ -413,7 +414,7 @@ def highlight_out_of_range(ws, daily_counts, biz_days):
 
 def add_total_conditional_formatting(ws, biz_days):
     """Total（row84）に、生成時点の状態に関わらず常に正しく判定されるよう、
-    Excelの条件付き書式（4人未満・7人以上を赤く強調）を追加する。
+    Excelの条件付き書式（4人以下・7人以上を赤く強調）を追加する。
 
     highlight_out_of_range() は生成した時点のdaily_countsに基づいて一度だけ
     セルを赤く塗るだけなので、生成後にExcel上で手作業によりシフト記号を
@@ -426,7 +427,7 @@ def add_total_conditional_formatting(ws, biz_days):
 
     対象は営業日（biz_days）の列だけに限定する。日曜日や固定休業日・月末以降の
     列はそもそもスタッフが配置されずTotalが0（または空）になるため、範囲に
-    含めてしまうと「営業日ではない日まで4人未満として赤字になる」誤表示になる
+    含めてしまうと「営業日ではない日まで4人以下として赤字になる」誤表示になる
     （ユーザー確認、2026-11：営業日以外は赤字対象外にする）。
     """
     if not biz_days:
@@ -727,7 +728,7 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
                     info['pattern'][day] = PAID_LEAVE_CODE
             info['blocked'] = g['blocked']
 
-    # --- Total（配置人数）が4〜6人の範囲外（4人未満・7人以上）の営業日を赤強調 ---
+    # --- Total（配置人数）が5〜6人の範囲外（4人以下・7人以上）の営業日を赤強調 ---
     for info in rows_info:
         write_pattern(ws, info['row'], info['pattern'])
     understaffed_days, overstaffed_days = highlight_out_of_range(ws, daily_counts, biz_days)
@@ -814,14 +815,14 @@ def review_unit(result, staff_master, year, month, requests, unit_label):
     if ok:
         lines.append('  ✓ 常勤スタッフの実質所定日数: 全員一致')
 
-    # (2) Total人数 4〜6人
+    # (2) Total人数 5〜6人
     if result['understaffed_days']:
         ok = False
         days_str = '、'.join(f'{d}日' for d in result['understaffed_days'])
-        lines.append(f'  ✗ Total人数が4人未満の営業日: {days_str}'
+        lines.append(f'  ✗ Total人数が4人以下の営業日: {days_str}'
                       '（勤務可能希望があれば埋まります。なければ人員確保の相談が必要）')
     else:
-        lines.append('  ✓ Total人数: 営業日はすべて4人以上')
+        lines.append('  ✓ Total人数: 営業日はすべて5人以上')
     if result['overstaffed_days']:
         days_str = '、'.join(f'{d}日' for d in result['overstaffed_days'])
         lines.append(f'  ・参考: Total人数が6人を超える営業日（出力Excel上は赤字表示）: {days_str}'
@@ -981,7 +982,7 @@ def build_report(result, staff_master, year, month, requests):
         summary = ', '.join(f'{k}:{v}' for k, v in counts.items())
         total = result['daily_counts'].get(day, 0)
         if day in result['understaffed_days']:
-            flag = '  ⚠4人未満'
+            flag = '  ⚠4人以下（有給含む）'
         elif day in result['overstaffed_days']:
             flag = '  ⚠6人超'
         else:
@@ -1070,8 +1071,9 @@ def main():
         f.write(f'{args.year}年{args.month}月: 所定勤務日数（常勤） = {target_days}日 '
                 f'（土日祝日 {off_days}日を除く）\n\n')
         if manual_staff:
-            f.write('※ 以下のスタッフは不定期勤務のため自動生成の対象外です。'
-                     '手作業でシフト記号を入力してください:\n')
+            f.write('※ 以下のスタッフは不定期勤務のため固定曜日の自動入力はありません。'
+                     '「出勤可能」「有給」の希望がある日だけシフトに反映されています。'
+                     'それ以外の勤務は手作業で入力してください:\n')
             f.write('  ' + '、'.join(manual_staff) + '\n\n')
         f.write(f'--- {new_am}（午前） ---\n{report_am}\n\n')
         f.write(f'--- {new_pm}（午後） ---\n{report_pm}\n\n')
@@ -1084,7 +1086,7 @@ def main():
     print(f'レポート: {report_path}')
     print('')
     if manual_staff:
-        print('不定期勤務のため未反映（手作業で入力）:', '、'.join(manual_staff))
+        print('不定期勤務（固定曜日なし。出勤可能・有給の希望日のみ反映済み）:', '、'.join(manual_staff))
     print('レビュー結果:', '午前=' + ('OK' if ok_am else '要確認'), '/', '午後=' + ('OK' if ok_pm else '要確認'),
           '/', '出勤日一致=' + ('OK' if ok_align else '要確認'))
     print('詳細はレポートファイルのレビュー欄を確認してください。')
