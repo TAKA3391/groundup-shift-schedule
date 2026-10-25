@@ -417,6 +417,34 @@ def highlight_out_of_range(ws, daily_counts, biz_days):
     return understaffed, overstaffed
 
 
+STANDARD_STAFF_FONT = 'HGSｺﾞｼｯｸM'
+STAFF_INFO_COLUMNS = ('C', 'G', 'H', 'L')  # 職種・勤務形態・資格・氏名
+
+
+def normalize_staff_info_fonts(ws, first_row=20):
+    """スタッフ行の「職種・勤務形態・資格・氏名」欄のフォント名を様式の標準
+    （HGSｺﾞｼｯｸM）に揃える（ユーザー確定ルール、2026-10）。
+
+    コピー元の様式で若尾・大野・織田の行がArial、一部の行の氏名がTimes New Romanに
+    なっていたため。文字サイズ・太さ・色・配置は変えず、フォント名だけを揃える。
+    結合セルの先頭セル以外（MergedCell）は対象外。
+    """
+    from copy import copy
+    from openpyxl.cell.cell import MergedCell
+    changed = 0
+    for r in range(first_row, STAFF_ROWS_END):
+        for col in STAFF_INFO_COLUMNS:
+            cell = ws[f'{col}{r}']
+            if isinstance(cell, MergedCell) or cell.value in (None, ''):
+                continue
+            if cell.font.name != STANDARD_STAFF_FONT:
+                f = copy(cell.font)
+                f.name = STANDARD_STAFF_FONT
+                cell.font = f
+                changed += 1
+    return changed
+
+
 def add_total_conditional_formatting(ws, biz_days):
     """Total（row84）に、生成時点の状態に関わらず常に正しく判定されるよう、
     Excelの条件付き書式（4人以下・7人以上を赤く強調）を追加する。
@@ -891,6 +919,7 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
     # 生成後にExcel上で手作業修正しても赤字判定が追従するよう、条件付き書式も設定する
     # （日曜・固定休業日などの営業日以外は対象外にする）
     add_total_conditional_formatting(ws, biz_days)
+    normalize_staff_info_fonts(ws)
 
     all_patterns = {}
     code_by_key = {}
