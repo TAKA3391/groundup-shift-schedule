@@ -193,14 +193,15 @@ def load_service_hours_table(path='shift_codes.csv'):
     return table
 
 
-# 午後（2単位目）シートで、特定のスタッフの特定の曜日の勤務を配置人数（Total）に
-# 数えないルール（ユーザー確定ルール、2026-10）。
-#   ・鷹野かおり・永田千尋（看護職員）の木曜日の勤務分は数えない。
-#   ・永田さんの火曜日の勤務分は数える（＝除外しない。通常どおり）。
+# 午後（2単位目）シートで、特定のスタッフの勤務を配置人数（Total）に数えないルール
+# （ユーザー確定ルール、2026-10）。
+#   ・鷹野かおり（看護職員）は午後シートでは全日数えない（weekday=None は全曜日）。
+#   ・永田千尋（看護職員）は木曜日の勤務分だけ数えない。火曜日の勤務分は数える。
 # 曜日は Mon=0 ... Sun=6。有給（シフト記号「有」）は勤務ではないので除外せず、
 # 従来どおり数える。
 TOTAL_EXCLUDE_RULES = (
-    {'unit': 'PM', 'names': ('鷹野かおり', '永田千尋'), 'weekday': 3},
+    {'unit': 'PM', 'names': ('鷹野かおり',), 'weekday': None},
+    {'unit': 'PM', 'names': ('永田千尋',), 'weekday': 3},
 )
 
 
@@ -210,7 +211,8 @@ def is_excluded_from_total(name, unit, year, month, day, code=None):
         return False
     wd = datetime.date(year, month, day).weekday()
     for rule in TOTAL_EXCLUDE_RULES:
-        if rule['unit'] == unit and name in rule['names'] and wd == rule['weekday']:
+        if (rule['unit'] == unit and name in rule['names']
+                and (rule['weekday'] is None or wd == rule['weekday'])):
             return True
     return False
 
@@ -646,8 +648,6 @@ def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month, bala
     movable = [g for g in groups if not g['forced']]
     if not movable:
         return
-    rng = random.Random(20261023)
-
     def apply_move(g, a, b):
         g['days'].discard(a)
         g['days'].add(b)
@@ -666,26 +666,33 @@ def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month, bala
 
     cost = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
     best_cost, best_snap = cost, snapshot()
+    start_snap = snapshot()
     steps = 8000
     t_start, t_end = 400.0, 0.5
-    for i in range(steps):
-        temp = t_start * (t_end / t_start) ** (i / steps)
-        g = rng.choice(movable)
-        pinned = g.get('pinned', set())
-        movable_days = sorted(g['days'] - pinned)
-        offs = [d for d in biz_days if d not in g['days'] and d not in g['blocked']]
-        if not movable_days or not offs:
-            continue
-        a = rng.choice(movable_days)
-        b = rng.choice(offs)
-        apply_move(g, a, b)
-        c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
-        if c2 <= cost or rng.random() < math.exp(-(c2 - cost) / temp):
-            cost = c2
-            if cost < best_cost - 1e-9:
-                best_cost, best_snap = cost, snapshot()
-        else:
-            apply_move(g, b, a)
+    # 乱数シードを変えて複数回探索し、いちばんコストの低い配置を採用する
+    # （1回だけだと局所解に捕まり、Total不足の日が残ることがあるため）。
+    for seed in (20261023, 1, 2, 3, 4):
+        restore(start_snap)
+        rng = random.Random(seed)
+        cost = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
+        for i in range(steps):
+            temp = t_start * (t_end / t_start) ** (i / steps)
+            g = rng.choice(movable)
+            pinned = g.get('pinned', set())
+            movable_days = sorted(g['days'] - pinned)
+            offs = [d for d in biz_days if d not in g['days'] and d not in g['blocked']]
+            if not movable_days or not offs:
+                continue
+            a = rng.choice(movable_days)
+            b = rng.choice(offs)
+            apply_move(g, a, b)
+            c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
+            if c2 <= cost or rng.random() < math.exp(-(c2 - cost) / temp):
+                cost = c2
+                if cost < best_cost - 1e-9:
+                    best_cost, best_snap = cost, snapshot()
+            else:
+                apply_move(g, b, a)
     restore(best_snap)
     cost = best_cost
 
