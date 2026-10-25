@@ -79,7 +79,12 @@ TOTAL_ROW = 84
 # （2026-10）：対象月の日曜（営業日でない日）は0にする。
 CAPACITY_ROW = 77
 SERVICE_TIME_ROW = 78
-MAX_CONSECUTIVE_WORK_DAYS = 5  # 「6日以上の連続勤務」を避けるため、連続は5日まで
+MAX_CONSECUTIVE_WORK_DAYS = 5  # パート: 「6日以上の連続勤務」を避ける（固定パターンは変更せず検知のみ）
+# 常勤: 5連勤（連続5日以上）を避け、連続は4日まで（ユーザー確定ルール、2026-10）。
+FT_MAX_CONSECUTIVE_WORK_DAYS = 4
+# 4連勤もできる限り避けたい常勤（ユーザー確定ルール、2026-10）。4連勤は「参考」扱いの
+# ペナルティ付きで極力避けるが、人員確保（Total5〜6人）を優先する場面では許容される。
+AVOID_4_RUN_NAMES = ('宮路愛',)
 # 有給（シフト記号「有」）の人も含めたTotalが4人以下（＝5人未満）の営業日は赤字（ユーザー確定ルール、2026-10）
 MIN_DAILY_TOTAL = 5
 MAX_DAILY_TOTAL = 6
@@ -473,17 +478,161 @@ def _pick_best_day(group, biz_days, daily_counts, allow_run_violation=False):
     candidates.sort(key=lambda d: (daily_counts[d], d))
     for d in candidates:
         trial = group['days'] | {d}
-        if max_consecutive_run(trial) <= MAX_CONSECUTIVE_WORK_DAYS:
+        if max_consecutive_run(trial) <= FT_MAX_CONSECUTIVE_WORK_DAYS:
             return d
     if allow_run_violation and candidates:
         return candidates[0]
     return None
 
 
-def allocate_full_time_groups(groups, biz_days, daily_counts):
+def holiday_pair_count(work_days, biz_days, days_in_month):
+    """連休の回数（土日・日月など）を数える。
+
+    隣り合う2日がどちらも休みで、かつどちらかが営業日でない日（日曜・固定休業日）
+    である組を1回と数える。例: 土曜休み＋日曜 → 1回（土日）、日曜＋月曜休み → 1回
+    （日月）、土日月と3連休なら2回。有給・休み希望の日も「休み」として数える。
+    """
+    biz = set(biz_days)
+    work = set(work_days)
+    n = 0
+    for d in range(1, days_in_month):
+        if d in work or (d + 1) in work:
+            continue
+        if d not in biz or (d + 1) not in biz:
+            n += 1
+    return n
+
+
+def _run_lengths(days):
+    s = sorted(days)
+    runs = []
+    cur = 0
+    prev = None
+    for d in s:
+        if prev is not None and d == prev + 1:
+            cur += 1
+        else:
+            if cur:
+                runs.append(cur)
+            cur = 1
+        prev = d
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month):
+    """常勤の出勤日配置の良し悪しを数値化する（小さいほど良い）。
+
+    - 5連勤以上（常勤）: 大きなペナルティ（連続日数が増えるほど急増）
+    - 4連勤（AVOID_4_RUN_NAMESの人だけ）: 中程度のペナルティ（できる限り避ける）
+    - Total人数が下限（MIN_DAILY_TOTAL）未満 / 上限（MAX_DAILY_TOTAL）超: ペナルティ
+    - 連休（土日・日月など）の回数が常勤スタッフ間でばらつくほどペナルティ
+    - 日ごとの配置人数のばらつき: 弱いペナルティ（従来の「手薄な日から埋める」の代わり）
+    """
+    cost = 0.0
+    pairs = []
+    for g in groups:
+        for r in _run_lengths(g['days']):
+            if r > FT_MAX_CONSECUTIVE_WORK_DAYS:
+                cost += 1000.0 * (r - FT_MAX_CONSECUTIVE_WORK_DAYS) ** 2
+            elif r == FT_MAX_CONSECUTIVE_WORK_DAYS and g['name'] in AVOID_4_RUN_NAMES:
+                cost += 60.0
+        pairs.append(holiday_pair_count(g['days'], biz_days, days_in_month))
+    if pairs:
+        mean = sum(pairs) / len(pairs)
+        cost += 25.0 * sum((p - mean) ** 2 for p in pairs)
+    for d in biz_days:
+        c = daily_counts.get(d, 0)
+        if c < MIN_DAILY_TOTAL:
+            cost += 800.0 * (MIN_DAILY_TOTAL - c)
+        elif c > MAX_DAILY_TOTAL:
+            cost += 300.0 * (c - MAX_DAILY_TOTAL)
+        cost += 5.0 * (c - (MIN_DAILY_TOTAL + MAX_DAILY_TOTAL) / 2.0) ** 2
+    return cost
+
+
+def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month):
+    """出勤日の「付け替え」（ある出勤日を別の休みの日に移す。出勤日数は変えない）で、
+    5連勤・4連勤（宮路さん）を避けつつ、連休の回数を常勤スタッフ間で均等に近づける。
+
+    焼きなまし法（乱数シード固定＝同じ入力なら同じ結果）で大きく探索したあと、
+    最後に山登り法で仕上げる。「出勤可能」と申告された日・1単位目から引き継いだ日
+    （forced）は動かさない。
+    """
+    import math
+    import random
+    movable = [g for g in groups if not g['forced']]
+    if not movable:
+        return
+    rng = random.Random(20261023)
+
+    def apply_move(g, a, b):
+        g['days'].discard(a)
+        g['days'].add(b)
+        daily_counts[a] -= g['weight']
+        daily_counts[b] = daily_counts.get(b, 0) + g['weight']
+
+    def snapshot():
+        return ({id(g): set(g['days']) for g in movable}, dict(daily_counts))
+
+    def restore(snap):
+        days_by_id, counts = snap
+        for g in movable:
+            g['days'] = set(days_by_id[id(g)])
+        daily_counts.clear()
+        daily_counts.update(counts)
+
+    cost = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month)
+    best_cost, best_snap = cost, snapshot()
+    steps = 8000
+    t_start, t_end = 400.0, 0.5
+    for i in range(steps):
+        temp = t_start * (t_end / t_start) ** (i / steps)
+        g = rng.choice(movable)
+        pinned = g.get('pinned', set())
+        movable_days = sorted(g['days'] - pinned)
+        offs = [d for d in biz_days if d not in g['days'] and d not in g['blocked']]
+        if not movable_days or not offs:
+            continue
+        a = rng.choice(movable_days)
+        b = rng.choice(offs)
+        apply_move(g, a, b)
+        c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month)
+        if c2 <= cost or rng.random() < math.exp(-(c2 - cost) / temp):
+            cost = c2
+            if cost < best_cost - 1e-9:
+                best_cost, best_snap = cost, snapshot()
+        else:
+            apply_move(g, b, a)
+    restore(best_snap)
+    cost = best_cost
+
+    # 仕上げ: 山登り法（改善する付け替えがなくなるまで）
+    for _ in range(500):
+        best = None
+        for g in movable:
+            pinned = g.get('pinned', set())
+            offs = [d for d in biz_days if d not in g['days'] and d not in g['blocked']]
+            for a in sorted(g['days'] - pinned):
+                for b in offs:
+                    apply_move(g, a, b)
+                    c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month)
+                    apply_move(g, b, a)
+                    if c2 < cost - 1e-9 and (best is None or c2 < best[0] - 1e-9):
+                        best = (c2, g, a, b)
+        if best is None:
+            break
+        cost, g, a, b = best
+        apply_move(g, a, b)
+
+
+def allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month=None):
     """常勤スタッフ（兼務者は氏名単位でグループ化済み）を、
-    実質所定日数まで、その時点で最も手薄な営業日から順にラウンドロビンで埋める。
-    6日以上連続勤務にならないよう候補日をガードする。
+    実質所定日数まで、その時点で最も手薄な営業日から順にラウンドロビンで埋めた後、
+    出勤日の付け替えで次を改善する（ユーザー確定ルール、2026-10）:
+      1) 常勤は5連勤（連続5日以上）を避ける。宮路さんは4連勤もできる限り避ける。
+      2) 連休（土日・日月など）の回数を常勤スタッフ間でなるべく均等にする。
 
     'forced'（1単位目で確定した出勤日をそのまま適用する2単位目のグループ）は
     ここでは一切動かさない。target未達でも独自に埋め直さない（ユーザー確定ルール、
@@ -493,6 +642,8 @@ def allocate_full_time_groups(groups, biz_days, daily_counts):
     for g in groups:
         g.setdefault('run_violation', False)
         g.setdefault('forced', False)
+        # 「出勤可能」と申告された日は動かさない
+        g['pinned'] = set(g['days']) if not g['forced'] else set()
 
     active = [g for g in groups if len(g['days']) < g['target'] and not g['forced']]
     while active:
@@ -502,10 +653,8 @@ def allocate_full_time_groups(groups, biz_days, daily_counts):
                 continue
             day = _pick_best_day(g, biz_days, daily_counts)
             if day is None:
-                # 連続勤務ガードで詰まった場合のみ、緩めて確保する（要確認フラグを立てる）
+                # 連続勤務ガードで詰まった場合のみ、緩めて確保する（後段の付け替えで解消を試みる）
                 day = _pick_best_day(g, biz_days, daily_counts, allow_run_violation=True)
-                if day is not None:
-                    g['run_violation'] = True
             if day is not None:
                 g['days'].add(day)
                 daily_counts[day] = daily_counts.get(day, 0) + g['weight']
@@ -513,8 +662,15 @@ def allocate_full_time_groups(groups, biz_days, daily_counts):
         active = [g for g in active if len(g['days']) < g['target']]
         if not progressed:
             break
+
+    if days_in_month is None:
+        days_in_month = max(biz_days) if biz_days else 31
+    _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month)
+
     for g in groups:
         g['shortage'] = max(0, g['target'] - len(g['days']))
+        if not g['forced']:
+            g['run_violation'] = max_consecutive_run(g['days']) > FT_MAX_CONSECUTIVE_WORK_DAYS
     return groups
 
 
@@ -715,7 +871,7 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
                 daily_counts[day] += pl_weight
 
     groups.sort(key=lambda g: g['name'])
-    allocate_full_time_groups(groups, biz_days, daily_counts)
+    allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month)
 
     for g in groups:
         for info in g['infos']:
@@ -828,13 +984,24 @@ def review_unit(result, staff_master, year, month, requests, unit_label):
         lines.append(f'  ・参考: Total人数が6人を超える営業日（出力Excel上は赤字表示）: {days_str}'
                       '（自動では減らしていません。必要なら手動調整してください）')
 
-    # (3) 連続勤務6日以上
+    # (3) 連続勤務（常勤は5連勤以上、パートは6日以上を警告）
     if result['run_violations']:
         ok = False
         for name, run in result['run_violations'].items():
-            lines.append(f'  ✗ {name}: 連続勤務{run}日（6日以上）')
+            lines.append(f'  ✗ {name}: 連続勤務{run}日（常勤は5日以上／パートは6日以上。所定日数や休み希望の都合で避けきれない場合があります。要確認）')
     else:
-        lines.append('  ✓ 連続勤務: 6日以上の連続勤務なし')
+        lines.append('  ✓ 連続勤務: 常勤の5連勤以上・パートの6日以上の連続勤務なし')
+    for g in result['groups']:
+        if g['name'] in AVOID_4_RUN_NAMES and max_consecutive_run(g['days']) == FT_MAX_CONSECUTIVE_WORK_DAYS:
+            lines.append(f"  ・参考: {g['name']}は4連勤があります（できる限り避ける対象。人員確保のため残した可能性）")
+
+    # (3b) 連休（土日・日月など）の回数の均等さ（参考表示）
+    pair_counts = {g['name']: holiday_pair_count(g['days'], result['biz_days'], result['days_in_month'])
+                   for g in result['groups']}
+    if pair_counts:
+        spread = max(pair_counts.values()) - min(pair_counts.values())
+        detail = '、'.join(f'{n}{c}回' for n, c in pair_counts.items())
+        lines.append(f'  ・参考: 常勤の連休（土日・日月など）の回数 {detail}（最大差{spread}回）')
 
     # (4) 兼務者（同一人物・複数行）の勤務日一致
     mismatch = False
