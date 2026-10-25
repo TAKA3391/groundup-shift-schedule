@@ -193,6 +193,28 @@ def load_service_hours_table(path='shift_codes.csv'):
     return table
 
 
+# 午後（2単位目）シートで、特定のスタッフの特定の曜日の勤務を配置人数（Total）に
+# 数えないルール（ユーザー確定ルール、2026-10）。
+#   ・鷹野かおり・永田千尋（看護職員）の木曜日の勤務分は数えない。
+#   ・永田さんの火曜日の勤務分は数える（＝除外しない。通常どおり）。
+# 曜日は Mon=0 ... Sun=6。有給（シフト記号「有」）は勤務ではないので除外せず、
+# 従来どおり数える。
+TOTAL_EXCLUDE_RULES = (
+    {'unit': 'PM', 'names': ('鷹野かおり', '永田千尋'), 'weekday': 3},
+)
+
+
+def is_excluded_from_total(name, unit, year, month, day, code=None):
+    """この人のこの日の勤務は、配置人数(Total)に数えない対象か"""
+    if code == PAID_LEAVE_CODE:
+        return False
+    wd = datetime.date(year, month, day).weekday()
+    for rule in TOTAL_EXCLUDE_RULES:
+        if rule['unit'] == unit and name in rule['names'] and wd == rule['weekday']:
+            return True
+    return False
+
+
 def counts_toward_total(code, role, service_hours_table, total_roles):
     """このシフト記号・職種が横浜市様式のTotal（配置人数、row84）にカウントされるか
 
@@ -417,6 +439,31 @@ def highlight_out_of_range(ws, daily_counts, biz_days):
     return understaffed, overstaffed
 
 
+def repair_missing_hour_formulas(ws, anchor_rows):
+    """各スタッフの「勤務時間数」「サービス提供時間内の勤務時間数」行（記号行の1行下・2行下）
+    で、日付列の数式が抜けているセルを、同じ行のS列（1日）の数式から補う。
+
+    ベース様式（シフト2026.xlsx）には、藤田法成さんの行の14日の列（AF）だけ数式が
+    抜けている箇所があり、その日に藤田さんを出勤させるとExcelのTotal・勤務時間数に
+    反映されず、スクリプトの集計と1人ずつズレる不具合があった（2026-10、11月分で発覚）。
+    """
+    import re
+    fixed = []
+    first = FIRST_DAY_COL
+    for r in anchor_rows:
+        for off in (1, 2):
+            base = ws.cell(r + off, first).value
+            if not (isinstance(base, str) and base.startswith('=')):
+                continue
+            for c in range(first, first + 31):
+                cell = ws.cell(r + off, c)
+                if cell.value is None:
+                    col = get_column_letter(c)
+                    cell.value = re.sub(r'(?<![A-Za-z$])S(?=\d)', col, base)
+                    fixed.append(cell.coordinate)
+    return fixed
+
+
 STANDARD_STAFF_FONT = 'HGSｺﾞｼｯｸM'
 STAFF_INFO_COLUMNS = ('C', 'G', 'H', 'L')  # 職種・勤務形態・資格・氏名
 
@@ -549,7 +596,7 @@ def _run_lengths(days):
     return runs
 
 
-def _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month):
+def _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx=None):
     """常勤の出勤日配置の良し悪しを数値化する（小さいほど良い）。
 
     - 5連勤以上（常勤）: 大きなペナルティ（連続日数が増えるほど急増）
@@ -571,16 +618,22 @@ def _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month):
         mean = sum(pairs) / len(pairs)
         cost += 25.0 * sum((p - mean) ** 2 for p in pairs)
     for d in biz_days:
-        c = daily_counts.get(d, 0)
-        if c < MIN_DAILY_TOTAL:
-            cost += 800.0 * (MIN_DAILY_TOTAL - c)
-        elif c > MAX_DAILY_TOTAL:
-            cost += 300.0 * (c - MAX_DAILY_TOTAL)
-        cost += 5.0 * (c - (MIN_DAILY_TOTAL + MAX_DAILY_TOTAL) / 2.0) ** 2
+        counts_for_day = [daily_counts.get(d, 0)]
+        if balance_ctx:
+            # 常勤の出勤日は午前・午後で共通なので、もう一方のシート（午後など）の
+            # Totalも同じ基準で評価する（もう一方のパート等の人数＋この常勤の人数）。
+            ft_c = daily_counts.get(d, 0) - balance_ctx['this_pt'].get(d, 0)
+            counts_for_day.append(balance_ctx['other_pt'].get(d, 0) + ft_c)
+        for c in counts_for_day:
+            if c < MIN_DAILY_TOTAL:
+                cost += 800.0 * (MIN_DAILY_TOTAL - c)
+            elif c > MAX_DAILY_TOTAL:
+                cost += 300.0 * (c - MAX_DAILY_TOTAL)
+            cost += 5.0 * (c - (MIN_DAILY_TOTAL + MAX_DAILY_TOTAL) / 2.0) ** 2
     return cost
 
 
-def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month):
+def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month, balance_ctx=None):
     """出勤日の「付け替え」（ある出勤日を別の休みの日に移す。出勤日数は変えない）で、
     5連勤・4連勤（宮路さん）を避けつつ、連休の回数を常勤スタッフ間で均等に近づける。
 
@@ -611,7 +664,7 @@ def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month):
         daily_counts.clear()
         daily_counts.update(counts)
 
-    cost = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month)
+    cost = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
     best_cost, best_snap = cost, snapshot()
     steps = 8000
     t_start, t_end = 400.0, 0.5
@@ -626,7 +679,7 @@ def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month):
         a = rng.choice(movable_days)
         b = rng.choice(offs)
         apply_move(g, a, b)
-        c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month)
+        c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
         if c2 <= cost or rng.random() < math.exp(-(c2 - cost) / temp):
             cost = c2
             if cost < best_cost - 1e-9:
@@ -645,7 +698,7 @@ def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month):
             for a in sorted(g['days'] - pinned):
                 for b in offs:
                     apply_move(g, a, b)
-                    c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month)
+                    c2 = _ft_schedule_cost(groups, biz_days, daily_counts, days_in_month, balance_ctx)
                     apply_move(g, b, a)
                     if c2 < cost - 1e-9 and (best is None or c2 < best[0] - 1e-9):
                         best = (c2, g, a, b)
@@ -655,7 +708,7 @@ def _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month):
         apply_move(g, a, b)
 
 
-def allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month=None):
+def allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month=None, balance_ctx=None):
     """常勤スタッフ（兼務者は氏名単位でグループ化済み）を、
     実質所定日数まで、その時点で最も手薄な営業日から順にラウンドロビンで埋めた後、
     出勤日の付け替えで次を改善する（ユーザー確定ルール、2026-10）:
@@ -693,7 +746,7 @@ def allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month=None
 
     if days_in_month is None:
         days_in_month = max(biz_days) if biz_days else 31
-    _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month)
+    _optimize_full_time_days(groups, biz_days, daily_counts, days_in_month, balance_ctx)
 
     for g in groups:
         g['shortage'] = max(0, g['target'] - len(g['days']))
@@ -707,7 +760,7 @@ def allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month=None
 # ---------------------------------------------------------------------------
 
 def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requests, year, month,
-                  svc_table, forced_ft_days=None):
+                  svc_table, forced_ft_days=None, other_pt_counts=None):
     """forced_ft_days: {氏名: {'days': set(出勤日), 'run_violation': bool}}（省略可）。
     指定された氏名の常勤スタッフは、ここで独自に出勤日を計算せず、この値をそのまま
     使う。1単位目（AM）の結果を2単位目（PM）に渡すことで、常勤スタッフの1単位目・
@@ -840,7 +893,12 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
         row_weight = 1 if counts_toward_total(code, info['role'], svc_table, total_roles) else 0
         pl_weight = 1 if counts_toward_total(PAID_LEAVE_CODE, info['role'], svc_table, total_roles) else 0
         for day, day_code in pattern.items():
+            if day_code != PAID_LEAVE_CODE and is_excluded_from_total(info['name'], unit, year, month, day, day_code):
+                continue  # 配置人数に数えない勤務（TOTAL_EXCLUDE_RULES）
             daily_counts[day] += pl_weight if day_code == PAID_LEAVE_CODE else row_weight
+
+    # パートスタッフだけの日別人数（もう一方のシートの常勤配置の評価に使う）
+    pt_counts = dict(daily_counts)
 
     # --- 常勤スタッフ: 氏名単位でグループ化（兼務者は勤務日を必ず揃える） ---
     ft_groups_by_name = {}
@@ -899,7 +957,9 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
                 daily_counts[day] += pl_weight
 
     groups.sort(key=lambda g: g['name'])
-    allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month)
+    balance_ctx = ({'this_pt': pt_counts, 'other_pt': other_pt_counts}
+                   if other_pt_counts is not None else None)
+    allocate_full_time_groups(groups, biz_days, daily_counts, days_in_month, balance_ctx)
 
     for g in groups:
         for info in g['infos']:
@@ -915,11 +975,19 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
     # --- Total（配置人数）が5〜6人の範囲外（4人以下・7人以上）の営業日を赤強調 ---
     for info in rows_info:
         write_pattern(ws, info['row'], info['pattern'])
+        # 配置人数に数えない勤務は、「サービス提供時間内の勤務時間数」の行（記号行の2行下）の
+        # 該当日を0にする。様式のTotal数式は、この行が0より大きいものだけを数えるため、
+        # 数式を書き換えずにTotalから外せる（他の日・他の人の数式には影響しない）。
+        for day, day_code in info['pattern'].items():
+            if is_excluded_from_total(info['name'], unit, year, month, day, day_code):
+                col = get_column_letter(FIRST_DAY_COL + day - 1)
+                ws[f"{col}{info['row'] + 2}"] = 0
     understaffed_days, overstaffed_days = highlight_out_of_range(ws, daily_counts, biz_days)
     # 生成後にExcel上で手作業修正しても赤字判定が追従するよう、条件付き書式も設定する
     # （日曜・固定休業日などの営業日以外は対象外にする）
     add_total_conditional_formatting(ws, biz_days)
     normalize_staff_info_fonts(ws)
+    repair_missing_hour_formulas(ws, [info['row'] for info in rows_info])
 
     all_patterns = {}
     code_by_key = {}
@@ -949,6 +1017,10 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
 
     return {
         'ws': ws,
+        'unit': unit,
+        'pt_counts': pt_counts,
+        'year': year,
+        'month': month,
         'all_patterns': all_patterns,
         'code_by_key': code_by_key,
         'role_by_key': role_by_key,
@@ -1172,7 +1244,10 @@ def build_report(result, staff_master, year, month, requests):
             # 以前は氏名ごとの既定コード（code_by_key）を使っていたが、有休の日は
             # 既定コードと異なる記号（有）になるため、必ずpattern[day]を使う。
             if day in pattern and counts_toward_total(pattern[day], role_by_key.get(key),
-                                                        svc_table, total_roles):
+                                                        svc_table, total_roles) \
+                    and not is_excluded_from_total(key.split('（')[0], result.get('unit'),
+                                                   result.get('year', year), result.get('month', month),
+                                                   day, pattern[day]):
                 role = key.split('（')[-1].rstrip('）') if '（' in key else '?'
                 counts[role] = counts.get(role, 0) + 1
         summary = ', '.join(f'{k}:{v}' for k, v in counts.items())
@@ -1226,6 +1301,18 @@ def main():
         for g in result_am['groups']
     }
 
+    result_pm = process_unit(wb, args.source_pm, new_pm, 'PM', staff_master, requests, args.year, args.month,
+                              svc_table, forced_ft_days=forced_ft_days)
+
+    # 2周目: 常勤の出勤日は午前・午後で共通なので、1周目で分かった午後のパート人数を
+    # 考慮して午前の常勤の配置を決め直し、午後もそれに合わせて作り直す
+    # （午後だけTotalが足りない／多い日が出にくくなる）。
+    result_am = process_unit(wb, args.source_am, new_am, 'AM', staff_master, requests, args.year, args.month,
+                              svc_table, other_pt_counts=result_pm['pt_counts'])
+    forced_ft_days = {
+        g['name']: {'days': set(g['days']), 'run_violation': g.get('run_violation', False)}
+        for g in result_am['groups']
+    }
     result_pm = process_unit(wb, args.source_pm, new_pm, 'PM', staff_master, requests, args.year, args.month,
                               svc_table, forced_ft_days=forced_ft_days)
 
