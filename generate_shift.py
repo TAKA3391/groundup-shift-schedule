@@ -121,6 +121,17 @@ def is_business_day(d):
     return True
 
 
+def meeting_day(year, month):
+    """定期面談日: 第1月曜日。休業日に当たる場合は第2月曜日（ユーザー確定、2026-10）。
+    この日は常勤スタッフ全員が出勤する。"""
+    mondays = [d for d in range(1, calendar.monthrange(year, month)[1] + 1)
+               if datetime.date(year, month, d).weekday() == 0]
+    first = mondays[0]
+    if not is_business_day(datetime.date(year, month, first)):
+        return mondays[1]
+    return first
+
+
 def business_days_list(year, month):
     days_in_month = calendar.monthrange(year, month)[1]
     return [day for day in range(1, days_in_month + 1)
@@ -942,6 +953,10 @@ def process_unit(wb, source_sheet_name, new_sheet_name, unit, staff_master, requ
             forced_run_violation = bool(forced_info.get('run_violation', False))
         else:
             group_days = set(avail)
+            md = meeting_day(year, month)
+            # 定期面談日は常勤全員出勤（休み希望・有給の人は除く）。動かさない日として扱う
+            if md in biz_days and md not in blocked and md not in pl_days:
+                group_days.add(md)
             forced_run_violation = False
 
         group = {
