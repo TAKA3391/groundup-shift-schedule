@@ -22,12 +22,13 @@
     5/3・5/4・5/5（GW）、8/13・8/14・8/15（お盆）、
     12/30・12/31（年末）、1/1・1/2・1/3（年始）
   ※ この「営業日」は「スタッフに勤務させて良い日」の判定に使う。
-    常勤スタッフの所定勤務日数（下記）は、これとは別に「土日祝日
-    （国民の祝日を含む）」の日数を使って計算する、ユーザー確定の別ルール。
+    常勤スタッフの所定勤務日数（下記）は、土日祝日に加えて、この固定休業日
+    （会社が決めた休日）も引いて計算する（ユーザー確定、2026-11）。
 
 【常勤スタッフの所定勤務日数】
-  所定勤務日数 = その月の日数 - (土曜日数 + 日曜日数 + 祝日日数)
+  所定勤務日数 = その月の日数 - (土日祝日 と 固定休業日 の重複を除いた日数)
   例: 2026年10月は31日中、土日祝日が10日（土5・日4・祝1）なので所定21日・168時間。
+  例: 2026年12月は31日中、土日8日＋固定休業日12/30・31の2日＝10日なので所定21日。
 
 【使い方】
   python3 generate_shift.py --base シフト2026.xlsx --source-am 9月1 --source-pm 9月2 \
@@ -144,12 +145,16 @@ def full_time_target_days(year, month):
     ルール（ユーザー確定、2026-10時点）:
       事業所は日曜以外営業。常勤は「土日祝日の日数分」休みを取る
       （土曜や祝日に出た分は別の平日で調整して帳尻を合わせる）。
-      → 所定勤務日数 = その月の日数 - (土曜+日曜+祝日の日数)
+      → 所定勤務日数 = その月の日数 - (土曜・日曜・祝日・固定休業日 のいずれかに
+        当たる日数。重複は1日と数える)
       例: 2026年10月は31日中、土日祝日が10日なので所定21日。
+      例: 2026年12月は土日8日＋固定休業日(12/30・31)2日で、所定21日。
 
-    ※ ここでの「祝日」は国民の祝日（jpholidayで判定）全部を指し、上の
-      「営業日」の固定休業カレンダーとは別の概念。事業所自体はその祝日も
+    ※ 「祝日」は国民の祝日（jpholidayで判定）全部を指す。事業所自体はその祝日も
       営業している場合があるが、常勤スタッフの休日クオータとしてカウントする。
+    ※ 固定休業日（FIXED_CLOSURE_MD＝会社が決めた休日）は所定労働日に入らない
+      （ユーザー確定、2026-11。一般的な就業規則の考え方に合わせた）。
+      土日祝日と重なる日は二重に引かない。
     """
     days_in_month = calendar.monthrange(year, month)[1]
     off_days = 0
@@ -158,7 +163,8 @@ def full_time_target_days(year, month):
         wd = d.weekday()  # Mon=0 ... Sun=6
         is_weekend = wd in (5, 6)  # Sat, Sun
         is_holiday = jpholiday is not None and jpholiday.is_holiday(d)
-        if is_weekend or is_holiday:
+        is_closure = (d.month, d.day) in FIXED_CLOSURE_MD
+        if is_weekend or is_holiday or is_closure:
             off_days += 1
     return days_in_month - off_days, off_days
 
@@ -1374,7 +1380,7 @@ def main():
     report_path = str(Path(args.out).with_suffix('')) + '_report.txt'
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write(f'{args.year}年{args.month}月: 所定勤務日数（常勤） = {target_days}日 '
-                f'（土日祝日 {off_days}日を除く）\n\n')
+                f'（土日祝日・固定休業日 {off_days}日を除く）\n\n')
         if manual_staff:
             f.write('※ 以下のスタッフは不定期勤務のため固定曜日の自動入力はありません。'
                      '「出勤可能」「有給」の希望がある日だけシフトに反映されています。'
